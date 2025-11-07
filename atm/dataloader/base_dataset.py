@@ -99,6 +99,15 @@ class BaseDataset(Dataset):
 
             if self.cache_all:
                 demo = self.process_demo(demo)
+
+                task_str_word_list = fn.split('/')[-3].split('_')[2:-1]
+                if all(c.isupper() for c in task_str_word_list[0] if c.isalpha()): #remove first word if it's ALL CAPS (eg 'SCENE1')
+                    task_str_word_list = task_str_word_list[1:]
+
+                task_str = ' '.join(task_str_word_list)  # our model needs the task string, so we patch the DL here
+
+                demo['root']['task_str'] = task_str
+                
                 if not self.cache_image:
                     for v in self.views:
                         del demo["root"][v]["video"]

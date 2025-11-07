@@ -11,16 +11,17 @@ hydra:
     subdir: ${hydra.job.num}
 
 wandb:
-  project: atm_policy
+  project: traj_gen_policy
   name: ${now:%m%d}_${experiment}_${now:%H%M}_seed${seed}_${hydra:job.num}
-  group: ${experiment}
+  group: null
+  entity: let-it-flow
 
 train_gpus: [0]
 
 # Training
 lr: 5e-4
-batch_size: 128
-mix_precision: false
+batch_size: 32 # 128
+mix_precision: True # false
 num_workers: 8
 val_freq: 5
 save_freq: 10

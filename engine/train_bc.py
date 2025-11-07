@@ -47,6 +47,7 @@ def main(cfg: DictConfig):
 
     val_vis_dataset = BCDataset(dataset_dir=cfg.val_dataset, num_demos=cfg.val_num_demos, vis=True, **cfg.dataset_cfg, aug_prob=0.)
     val_vis_dataloader = get_dataloader(val_vis_dataset, mode="train", num_workers=1, batch_size=1)
+    print(f"{cfg.mix_precision=} ; {cfg.train_gpus=}", flush=True)
 
     fabric = Fabric(accelerator="cuda", devices=list(cfg.train_gpus), precision="bf16-mixed" if cfg.mix_precision else None, strategy="deepspeed")
     fabric.launch()
@@ -67,6 +68,7 @@ def main(cfg: DictConfig):
 
     fabric.barrier()
     model, optimizer = fabric.setup(model, optimizer)
+    model.mark_forward_method("forward_loss")
     train_loader = fabric.setup_dataloaders(train_loader)
 
     # Pick ckpt based on  the average of the last 5 epochs
@@ -166,12 +168,12 @@ def run_one_epoch(fabric,
 
     model.train()
     i = 0
-    for obs, track_obs, track, task_emb, action, extra_states in tqdm(dataloader):
+    for obs, track_obs, track, task_emb, action, extra_states, task_str in tqdm(dataloader):
         if mix_precision:
             obs, track_obs, track, task_emb, action = obs.bfloat16(), track_obs.bfloat16(), track.bfloat16(), task_emb.bfloat16(), action.bfloat16()
             extra_states = {k: v.bfloat16() for k, v in extra_states.items()}
 
-        loss, ret_dict = model.forward_loss(obs, track_obs, track, task_emb, extra_states, action)
+        loss, ret_dict = model.forward_loss(obs, track_obs, track, task_emb, extra_states, action, task_str)
         optimizer.zero_grad()
         fabric.backward(loss)
 
@@ -203,14 +205,14 @@ def evaluate(model, dataloader, mix_precision=False, tag="val"):
     model.eval()
 
     i = 0
-    for obs, track_obs, track, task_emb, action, extra_states in tqdm(dataloader):
+    for obs, track_obs, track, task_emb, action, extra_states, task_str in tqdm(dataloader):
         obs, track_obs, track, task_emb, action = obs.cuda(), track_obs.cuda(), track.cuda(), task_emb.cuda(), action.cuda()
         extra_states = {k: v.cuda() for k, v in extra_states.items()}
         if mix_precision:
             obs, track_obs, track, task_emb, action = obs.bfloat16(), track_obs.bfloat16(), track.bfloat16(), task_emb.bfloat16(), action.bfloat16()
             extra_states = {k: v.bfloat16() for k, v in extra_states.items()}
 
-        _, ret_dict = model.forward_loss(obs, track_obs, track, task_emb, extra_states, action)
+        _, ret_dict = model.forward_loss(obs, track_obs, track, task_emb, extra_states, action, task_str)
 
         i += 1
 

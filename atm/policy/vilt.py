@@ -7,6 +7,8 @@ import torch.nn as nn
 import torchvision.transforms as T
 
 from einops import rearrange, repeat
+from einops._torch_specific import allow_ops_in_compiled_graph  # requires einops>=0.6.1
+allow_ops_in_compiled_graph()
 
 from atm.model import *
 from atm.model.track_patch_embed import TrackPatchEmbed
@@ -17,11 +19,63 @@ from atm.policy.vilt_modules.extra_state_modules import ExtraModalityTokens
 from atm.policy.vilt_modules.policy_head import *
 from atm.utils.flow_utils import ImageUnNormalize, sample_double_grid, tracks_to_video
 
+import hydra
+import os
+from omegaconf import DictConfig
+
 ###############################################################################
 #
 # A ViLT Policy
 #
 ###############################################################################
+import tempfile
+
+from typing import List
+from pathlib import Path
+
+def consolidate_ckpt(checkpoint_path: str | Path):
+    if not isinstance(checkpoint_path, Path):
+        checkpoint_path = Path(checkpoint_path)
+
+    # Create a temporary file that we are guaranteed to have write access to
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+
+    try:
+        # Consolidate distributed checkpoint into the temporary file
+        torch.distributed.checkpoint.format_utils.dcp_to_torch_save(checkpoint_path, tmp_path)
+
+        # Load the state dict from the temporary file
+        state_dict = torch.load(tmp_path, map_location="cpu")["model"]
+    except Exception as e:
+        print(f"Checkpoint consolidation failed: {e}")
+        state_dict = None
+    finally:
+        # Clean up the temporary file
+        tmp_path.unlink(missing_ok=True)
+
+    # Return the full consolidated state dict (nothing is written to disk)
+    return state_dict
+
+def get_sd(ckpt_dir: str, drop_keys: List[str] = [], tag: str = None):
+    if tag is None:  # get latest ckpt
+        tag = sorted(os.listdir(os.path.join(ckpt_dir, "checkpoints")), key=lambda x: int(x.split("-")[-1]))[-1]
+
+    ckpt_path = os.path.join(ckpt_dir, "checkpoints", tag)
+    ckpt_files = os.listdir(ckpt_path)
+    print(f"Loading state dict from {ckpt_path} ...", flush=True)
+
+    if "model.pt" in ckpt_files:
+        sd = torch.load(os.path.join(ckpt_path, "model.pt"), map_location="cpu")
+    elif "inference.pt" in ckpt_files:
+        sd = torch.load(os.path.join(ckpt_path, "inference.pt"), map_location="cpu")
+    else:
+        sd = consolidate_ckpt(ckpt_path)  # consolidate distributed checkpoint into inference ckpt
+
+    for drop_key in drop_keys:
+        print(f"Dropping key {drop_key}", flush=True)
+        sd = {k: v for k, v in sd.items() if not k.startswith(drop_key)}
+    return sd
 
 
 class BCViLTPolicy(nn.Module):
@@ -32,7 +86,7 @@ class BCViLTPolicy(nn.Module):
 
     def __init__(self, obs_cfg, img_encoder_cfg, language_encoder_cfg, extra_state_encoder_cfg, track_cfg,
                  spatial_transformer_cfg, temporal_transformer_cfg,
-                 policy_head_cfg, load_path=None):
+                 policy_head_cfg, load_path=None, use_traj_gen: bool = False, traj_gen_path: str = None, ae_dir: str = None):
         super().__init__()
 
         self._process_obs_shapes(**obs_cfg)
@@ -44,7 +98,44 @@ class BCViLTPolicy(nn.Module):
         self.language_encoder_spatial = self._setup_language_encoder(output_size=self.spatial_embed_size, **language_encoder_cfg)
 
         # 3. Track Transformer module
-        self._setup_track(**track_cfg)
+        self.use_traj_gen = use_traj_gen
+        if self.use_traj_gen:
+            assert traj_gen_path is not None and ae_dir is not None, "When using trajectory generator, traj_gen_path and ae_dir must be provided."
+            import sys
+            sys.path.append("/export/home/ra48gaq/code/trajectory-ae/diffusion")
+            from diffusion.model.trajectory_gen_text import TrajRFText
+            # from diffusion.model.trajectory_gen import get_sd
+            
+            ### LOAD MODEL ###
+
+            cfg_traj_gen = DictConfig(
+                OmegaConf.load(os.path.join(traj_gen_path, ".hydra", "config.yaml")), flags={"allow_objects": True}
+            )
+            OmegaConf.resolve(cfg_traj_gen)
+            cfg_traj_gen_model = cfg_traj_gen.model
+            cfg_traj_gen_model.ae_ckpt_cfg.ae_ckpt = ae_dir
+            cfg_traj_gen_model.model_ckpt_cfg = {}
+            traj_gen = hydra.utils.instantiate(cfg_traj_gen_model)
+            traj_gen.eval()
+
+            ### LOAD CHECKPOINT ###
+            sd = get_sd(traj_gen_path, drop_keys=[])
+            traj_gen.load_state_dict(sd, strict=True)
+
+            # Compile UNET forward for speed
+            traj_gen.unet.forward = torch.compile(traj_gen.unet.forward, mode="reduce-overhead", dynamic=True)
+
+            self.track = traj_gen
+
+            self.num_track_ts = 1 # our latents completely compress temporal dim
+            self.num_track_ids = 1 # we dont have explicit trajectories, just one latent
+            self.num_track_patches_per_view = 16 * 16 # our latent dim is 16x16
+            self.policy_num_track_ts = 16 * 16 # our latent dim is 16x16
+            self.policy_num_track_ids = 4 # required to match input dim of policy head
+
+            self.track_up_proj = nn.Linear(16, 128)
+        else:
+            self._setup_track(**track_cfg)
 
         # 3. define spatial positional embeddings, modality embeddings, and spatial token for summary
         self._setup_spatial_positional_embeddings()
@@ -65,8 +156,10 @@ class BCViLTPolicy(nn.Module):
         self._setup_policy_head(**policy_head_cfg)
 
         if load_path is not None:
-            self.load(load_path)
-            self.track.load(f"{track_cfg.track_fn}/model_best.ckpt")
+            drop_keys = ['policy_head'] if self.use_traj_gen else []
+            self.load(load_path, strict=(not self.use_traj_gen), drop_keys=drop_keys)
+            if not self.use_traj_gen:
+                self.track.load(f"{track_cfg.track_fn}/model_best.ckpt")
 
     def _process_obs_shapes(self, obs_shapes, num_views, extra_states, img_mean, img_std, max_seq_len):
         self.img_normalizer = T.Normalize(img_mean, img_std)
@@ -133,14 +226,17 @@ class BCViLTPolicy(nn.Module):
         # setup positional embeddings
         spatial_token = nn.Parameter(torch.randn(1, 1, self.spatial_embed_size))  # SPATIAL_TOKEN
         img_patch_pos_embed = nn.Parameter(torch.randn(1, self.img_num_patches, self.spatial_embed_size))
-        track_patch_pos_embed = nn.Parameter(torch.randn(1, self.num_track_patches, self.spatial_embed_size-self.track_id_embed_dim))
+
+        if not self.use_traj_gen:
+            track_patch_pos_embed = nn.Parameter(torch.randn(1, self.num_track_patches, self.spatial_embed_size-self.track_id_embed_dim))
+            self.register_parameter("track_patch_pos_embed", track_patch_pos_embed)
+
         modality_embed = nn.Parameter(
             torch.randn(1, len(self.image_encoders) + self.num_views + 1, self.spatial_embed_size)
         )  # IMG_PATCH_TOKENS + TRACK_PATCH_TOKENS + SENTENCE_TOKEN
 
         self.register_parameter("spatial_token", spatial_token)
         self.register_parameter("img_patch_pos_embed", img_patch_pos_embed)
-        self.register_parameter("track_patch_pos_embed", track_patch_pos_embed)
         self.register_parameter("modality_embed", modality_embed)
 
         # for selecting modality embed
@@ -273,7 +369,51 @@ class BCViLTPolicy(nn.Module):
 
         return tr, _recon_tr
 
-    def spatial_encode(self, obs, track_obs, task_emb, extra_states, return_recon=False):
+    
+    def track_encode_traj_gen(self, track_obs, task_str: list[str], nfe: int = 10):
+        with torch.autocast(device_type=track_obs.device.type, dtype=torch.bfloat16):
+            B, v, t = track_obs.shape[:3]
+            v = 1 # for now we only use one view (side view)
+            sample_tensor = torch.randn(B * v * t, *self.track.val_shape).to(device=track_obs.device, dtype=track_obs.dtype)
+
+            points_per_traj = 64
+
+            grid_points = sample_double_grid(4, device=track_obs.device, dtype=track_obs.dtype)
+            query_pos = repeat(grid_points, "n c -> b_new n c", b_new=B * v * t)
+
+            track_conds = torch.zeros((B * v * t, 1, 5), device=track_obs.device, dtype=track_obs.dtype)
+
+            # for now, we use only the side view and the last of the 10 frames
+            track_obs = track_obs[:, 0, :, 0, ...]  # b v t tt_fs c h w -> b t c h w
+            track_obs = rearrange(track_obs, "b t c h w -> (b t) h w c")
+            track_obs = ((track_obs / 255.0) - 0.5) * 2 # map to [-1, 1] range
+
+            with torch.no_grad():
+                txt_emb = self.track.text_embedder(task_str).to(device=track_obs.device)
+                txt_emb = repeat(txt_emb, "b l e -> (b v t) l e", v=v, t=t)
+
+                # call super().sample to avoid decoding, as we do not need it here
+                track_embs = self.track.sample(sample_tensor, 
+                                                points_per_traj=points_per_traj, 
+                                                query_pos=query_pos, 
+                                                track_conds=track_conds, 
+                                                start_frame=track_obs, 
+                                                txt_emb=txt_emb,
+                                                sample_steps=nfe,
+                                                decode_latent=False)
+            
+            n = track_embs.shape[-2]
+
+            reshaped_latent = rearrange(track_embs, "(b v t) n c -> b v t 1 n c", b=B, v=v, t=t, n=n)
+            
+            track_embs = self.track_up_proj(track_embs)
+            track_embs = rearrange(track_embs, "(b v t) n c -> b (v t) n c", b=B, v=v, t=t)
+            track_embs = repeat(track_embs, "b t n c -> b t (v n) c", v=self.num_views)
+
+        return track_embs, reshaped_latent
+
+
+    def spatial_encode(self, obs, track_obs, task_emb, extra_states, return_recon=False, task_str=None):
         """
         Encode the images separately in the videos along the spatial axis.
         Args:
@@ -304,14 +444,19 @@ class BCViLTPolicy(nn.Module):
         text_encoded = text_encoded.view(B, 1, 1, -1).expand(-1, T, -1, -1)  # (b, t, 1, c)
 
         # 3. encode track
-        track_encoded, _recon_track = self.track_encode(track_obs, task_emb)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
-        # patch position embedding
-        tr_feat, tr_id_emb = track_encoded[:, :, :-self.track_id_embed_dim], track_encoded[:, :, -self.track_id_embed_dim:]
-        tr_feat += self.track_patch_pos_embed  # ((b t n), 2*patch_num, c)
-        # track id embedding
-        tr_id_emb[:, 1:, -self.track_id_embed_dim:] = tr_id_emb[:, :1, -self.track_id_embed_dim:]  # guarantee the permutation invariance
-        track_encoded = torch.cat([tr_feat, tr_id_emb], dim=-1)
-        track_encoded = rearrange(track_encoded, "(b t n) pn d -> b t (n pn) d", b=B, t=T)  # (b, t, 2*num_track*num_track_patch, c)
+        if self.use_traj_gen:
+            assert task_str is not None, "When using trajectory generator, task_str must be provided."
+            track_encoded, _recon_track = self.track_encode_traj_gen(track_obs, task_str)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
+        else:
+            track_encoded, _recon_track = self.track_encode(track_obs, task_emb)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
+
+            # patch position embedding
+            tr_feat, tr_id_emb = track_encoded[:, :, :-self.track_id_embed_dim], track_encoded[:, :, -self.track_id_embed_dim:]
+            tr_feat += self.track_patch_pos_embed  # ((b t n), 2*patch_num, c)
+            # track id embedding
+            tr_id_emb[:, 1:, -self.track_id_embed_dim:] = tr_id_emb[:, :1, -self.track_id_embed_dim:]  # guarantee the permutation invariance
+            track_encoded = torch.cat([tr_feat, tr_id_emb], dim=-1)
+            track_encoded = rearrange(track_encoded, "(b t n) pn d -> b t (n pn) d", b=B, t=T)  # (b, t, 2*num_track*num_track_patch, c)
 
         # 3. concat img + track + text embs then add modality embeddings
         if self.spatial_transformer_use_text:
@@ -371,7 +516,7 @@ class BCViLTPolicy(nn.Module):
         x = x.reshape(*sh)  # (b, t, num_modality, c)
         return x[:, :, 0]  # (b, t, c)
 
-    def forward(self, obs, track_obs, track, task_emb, extra_states):
+    def forward(self, obs, track_obs, track, task_emb, extra_states, task_str=None):
         """
         Return feature and info.
         Args:
@@ -379,17 +524,16 @@ class BCViLTPolicy(nn.Module):
             track_obs: b v t tt_fs c h w
             track: b v t track_len n 2, not used for training, only preserved for unified interface
             extra_states: {k: b t e}
+            task_str: List of task strings (length b)
         """
-        x, recon_track = self.spatial_encode(obs, track_obs, task_emb, extra_states, return_recon=True)  # x: (b, t, 2+num_extra, c), recon_track: (b, v, t, tl, n, 2)
+        x, recon_track = self.spatial_encode(obs, track_obs, task_emb, extra_states, return_recon=True, task_str=task_str)  # x: (b, t, 2+num_extra, c), recon_track: (b, v, t, tl, n, 2)
         x = self.temporal_encode(x)  # (b, t, c)
-
         recon_track = rearrange(recon_track, "b v t tl n d -> b t (v tl n d)")
         x = torch.cat([x, recon_track], dim=-1)  # (b, t, c + v*tl*n*2)
-
         dist = self.policy_head(x)  # only use the current timestep feature to predict action
         return dist
 
-    def forward_loss(self, obs, track_obs, track, task_emb, extra_states, action):
+    def forward_loss(self, obs, track_obs, track, task_emb, extra_states, action, task_str=None):
         """
         Args:
             obs: b v t c h w
@@ -397,9 +541,10 @@ class BCViLTPolicy(nn.Module):
             track: b v t track_len n 2, not used for training, only preserved for unified interface
             task_emb: b emb_size
             action: b t act_dim
+            task_str: List of task strings (length b)
         """
         obs, track, action = self.preprocess(obs, track, action)
-        dist = self.forward(obs, track_obs, track, task_emb, extra_states)
+        dist = self.forward(obs, track_obs, track, task_emb, extra_states, task_str)
         loss = self.policy_head.loss_fn(dist, action, reduction="mean")
 
         ret_dict = {
@@ -460,7 +605,7 @@ class BCViLTPolicy(nn.Module):
                 all_ret_dict[k] = np.mean(v)
         return None, all_ret_dict
 
-    def act(self, obs, task_emb, extra_states):
+    def act(self, obs, task_emb, extra_states, task_str=None):
         """
         Args:
             obs: (b, v, h, w, c)
@@ -494,7 +639,7 @@ class BCViLTPolicy(nn.Module):
         obs = self._preprocess_rgb(obs)
 
         with torch.no_grad():
-            x, rec_tracks = self.spatial_encode(obs, track_obs, task_emb=task_emb, extra_states=extra_states, return_recon=True)  # x: (b, 1, 4, c), recon_track: (b, v, 1, tl, n, 2)
+            x, rec_tracks = self.spatial_encode(obs, track_obs, task_emb=task_emb, extra_states=extra_states, return_recon=True, task_str=task_str)  # x: (b, 1, 4, c), recon_track: (b, v, 1, tl, n, 2)
             self.latent_queue.append(x)
             x = torch.cat(list(self.latent_queue), dim=1)  # (b, t, 4, c)
             x = self.temporal_encode(x)  # (b, t, c)
@@ -515,8 +660,12 @@ class BCViLTPolicy(nn.Module):
     def save(self, path):
         torch.save(self.state_dict(), path)
 
-    def load(self, path):
-        self.load_state_dict(torch.load(path, map_location="cpu"))
+    def load(self, path, strict: bool = True, drop_keys: list[str] = []):
+        sd = torch.load(path, map_location="cpu")
+        for drop_key in drop_keys:
+            print(f"Dropping key {drop_key}", flush=True)
+            sd = {k: v for k, v in sd.items() if not k.startswith(drop_key)}
+        self.load_state_dict(sd, strict=strict)
 
     def train(self, mode=True):
         super().train(mode)

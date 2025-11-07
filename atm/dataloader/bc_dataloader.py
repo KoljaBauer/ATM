@@ -31,6 +31,8 @@ class BCDataset(BaseDataset):
                     all_view_track_transformer_frames.append(
                         torch.stack([self._load_image_list_from_disk(demo_id, view, time_offset + t, num_frames=self.track_obs_fs, backward=True) for t in range(self.frame_stack)])
                     )  # t tt_fs c h w
+
+            task_str = demo['root']['task_str']
         else:
             demo_pth = self._demo_id_to_path[demo_id]
             demo = self.process_demo(self.load_h5(demo_pth))
@@ -41,6 +43,12 @@ class BCDataset(BaseDataset):
                 all_view_track_transformer_frames.append(
                     torch.stack([self._load_image_list_from_demo(demo, view, time_offset + t, num_frames=self.track_obs_fs, backward=True) for t in range(self.frame_stack)])
                 )  # t tt_fs c h w
+
+            task_str_word_list = demo_pth.split('/')[-3].split('_')[2:-1]
+            if all(c.isupper() for c in task_str_word_list[0] if c.isalpha()): #remove first word if it's ALL CAPS (eg 'SCENE1')
+                task_str_word_list = task_str_word_list[1:]
+
+            task_str = ' '.join(task_str_word_list)  # our model needs the task string, so we patch the DL here
 
         all_view_tracks = []
         all_view_vis = []
@@ -80,5 +88,7 @@ class BCDataset(BaseDataset):
         task_embs = demo["root"]["task_emb_bert"]
         extra_states = {k: v[time_offset:time_offset + self.frame_stack] for k, v in
                         demo['root']['extra_states'].items()}
+        
+        
 
-        return obs, track_transformer_obs, track, task_embs, actions, extra_states
+        return obs, track_transformer_obs, track, task_embs, actions, extra_states, task_str

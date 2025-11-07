@@ -16,14 +16,15 @@ from hydra.utils import to_absolute_path
 
 from atm.utils.flow_utils import sample_from_mask, sample_double_grid
 from atm.utils.cotracker_utils import Visualizer
+from accelerate import Accelerator
 
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
-EXTRA_STATES_KEYS = ['gripper_states', 'joint_states', 'ee_ori', 'ee_pos', 'ee_states']
+EXTRA_STATES_KEYS = ["gripper_states", "joint_states", "ee_ori", "ee_pos", "ee_states"]
 
 
 def get_task_name_from_file_name(file_name):
-    name = file_name.replace('_demo', '')
+    name = file_name.replace("_demo", "")
     if name[0].isupper():  # LIBERO-10 and LIBERO-90
         if "SCENE10" in name:
             language = " ".join(name[name.find("SCENE") + 8 :].split("_"))
@@ -39,12 +40,8 @@ def get_task_embs(cfg, descriptions):
     Bert embeddings for task embeddings. Borrow from https://github.com/Lifelong-Robot-Learning/LIBERO/blob/f78abd68ee283de9f9be3c8f7e2a9ad60246e95c/libero/lifelong/utils.py#L152.
     """
     if cfg.task_embedding_format == "bert":
-        tz = AutoTokenizer.from_pretrained(
-            "bert-base-cased", cache_dir=to_absolute_path("./data/bert")
-        )
-        model = AutoModel.from_pretrained(
-            "bert-base-cased", cache_dir=to_absolute_path("./data/bert")
-        )
+        tz = AutoTokenizer.from_pretrained("bert-base-cased", cache_dir=to_absolute_path("./data/bert"))
+        model = AutoModel.from_pretrained("bert-base-cased", cache_dir=to_absolute_path("./data/bert"))
         tokens = tz(
             text=descriptions,  # the sentence to be encoded
             add_special_tokens=True,  # Add [CLS] and [SEP]
@@ -55,9 +52,7 @@ def get_task_embs(cfg, descriptions):
         )
         masks = tokens["attention_mask"]
         input_ids = tokens["input_ids"]
-        task_embs = model(tokens["input_ids"], tokens["attention_mask"])[
-            "pooler_output"
-        ].detach()
+        task_embs = model(tokens["input_ids"], tokens["attention_mask"])["pooler_output"].detach()
     else:
         raise ValueError("Unsupported task embedding format")
     cfg.policy.language_encoder.network_kwargs.input_size = task_embs.shape[-1]
@@ -66,17 +61,19 @@ def get_task_embs(cfg, descriptions):
 
 def get_task_bert_embs(libero_root_dir):
     libero_h5_files = glob(os.path.join(libero_root_dir, "*/*.hdf5"))
-    task_names = set([get_task_name_from_file_name(os.path.basename(file).split('.')[0]) for file in libero_h5_files])
+    task_names = set([get_task_name_from_file_name(os.path.basename(file).split(".")[0]) for file in libero_h5_files])
     task_names = list(task_names)
 
     if not os.path.exists("libero/task_embedding_caches/task_emb_bert.npy"):
         # set the task embeddings
-        cfg = EasyDict({
-            "task_embedding_format": "bert",
-            "task_embedding_one_hot_offset": 1,
-            "data": {"max_word_len": 25},
-            "policy": {"language_encoder": {"network_kwargs": {"input_size": 768}}}
-        })  # hardcode the config to get task embeddings according to original Libero code
+        cfg = EasyDict(
+            {
+                "task_embedding_format": "bert",
+                "task_embedding_one_hot_offset": 1,
+                "data": {"max_word_len": 25},
+                "policy": {"language_encoder": {"network_kwargs": {"input_size": 768}}},
+            }
+        )  # hardcode the config to get task embeddings according to original Libero code
 
         task_embs = get_task_embs(cfg, task_names).cpu().numpy()
 
@@ -89,10 +86,14 @@ def get_task_bert_embs(libero_root_dir):
     return task_name_to_emb
 
 
-def track_and_remove(tracker, video, points, var_threshold=10.):
+def track_and_remove(tracker, video, points, var_threshold=10.0):
     B, T, C, H, W = video.shape
-    pred_tracks, pred_vis = tracker(video, queries=points, backward_tracking=True) # [1, T, N, 2]
+    pred_tracks, pred_vis = tracker(video, queries=points, backward_tracking=True)  # [1, T, N, 2]
 
+    print(
+        f"Computing variance on tracks of shape: {pred_tracks.shape} with min value {torch.min(pred_tracks)} and max value {torch.max(pred_tracks)} ; {pred_tracks.dtype=}",
+        flush=True,
+    )
     var = torch.var(pred_tracks, dim=1)  # [1, N, 2]
     var = torch.sum(var, dim=-1)[0]  # List
 
@@ -100,14 +101,14 @@ def track_and_remove(tracker, video, points, var_threshold=10.):
     idx = torch.where(var > var_threshold)[0]
     if len(idx) == 0:
         print(torch.max(var))
-        assert len(idx) > 0, 'No points with low variance'
+        assert len(idx) > 0, "No points with low variance"
 
     new_points = points[:, idx].clone()
 
     # Repeat and sample
     rep = points.shape[1] // len(idx) + 1
     new_points = torch.tile(new_points, (1, rep, 1))
-    new_points = new_points[:, :points.shape[1]]
+    new_points = new_points[:, : points.shape[1]]
     # Add 10 percent height and width as noise
     noise = torch.randn_like(new_points[:, :, 1:]) * 0.05 * H
     new_points[:, :, 1:] += noise
@@ -135,15 +136,26 @@ def track_through_video(video, track_model, num_points=1000):
     grid_points = torch.cat([torch.randint_like(grid_points[:, :1], 0, T), grid_points], dim=-1).cuda()
 
     pred_tracks, pred_vis = track_and_remove(track_model, video[None], points[None])
-    pred_grid_tracks, pred_grid_vis = track_and_remove(track_model, video[None], grid_points[None], var_threshold=0.)
+    pred_grid_tracks, pred_grid_vis = track_and_remove(track_model, video[None], grid_points[None], var_threshold=0.0)
 
     pred_tracks = torch.cat([pred_grid_tracks, pred_tracks], dim=2)
     pred_vis = torch.cat([pred_grid_vis, pred_vis], dim=2)
     return pred_tracks, pred_vis
 
 
-def collect_states_from_demo(h5_file, image_save_dir, demos_group, demo_k, view_names, track_model, task_emb, num_points, visualizer, save_vis=False):
-    actions = np.array(demos_group[demo_k]['actions'])
+def collect_states_from_demo(
+    h5_file,
+    image_save_dir,
+    demos_group,
+    demo_k,
+    view_names,
+    track_model,
+    task_emb,
+    num_points,
+    visualizer,
+    save_vis=False,
+):
+    actions = np.array(demos_group[demo_k]["actions"])
     root_grp = h5_file.create_group("root") if "root" not in h5_file else h5_file["root"]
     if "actions" not in root_grp:
         root_grp.create_dataset("actions", data=actions)
@@ -151,13 +163,13 @@ def collect_states_from_demo(h5_file, image_save_dir, demos_group, demo_k, view_
     if "extra_states" not in root_grp:
         extra_states_grp = root_grp.create_group("extra_states")
         for state_key in EXTRA_STATES_KEYS:
-            extra_states_grp.create_dataset(state_key, data=np.array(demos_group[demo_k]['obs'][state_key]))
+            extra_states_grp.create_dataset(state_key, data=np.array(demos_group[demo_k]["obs"][state_key]))
 
     if "task_emb_bert" not in root_grp:
         root_grp.create_dataset("task_emb_bert", data=task_emb)
 
     for view in view_names:
-        rgb = np.array(demos_group[demo_k]['obs'][f'{view}_rgb'])
+        rgb = np.array(demos_group[demo_k]["obs"][f"{view}_rgb"])
         rgb = rgb[:, ::-1, :, :].copy()  # The images in the raw Libero dataset is upsidedown, so we need to flip it
         rgb = rearrange(rgb, "t h w c -> t c h w")
         T, C, H, W = rgb.shape
@@ -196,35 +208,35 @@ def save_images(video, image_dir, view_name):
 
 def inital_save_h5(path, skip_exist):
     if os.path.exists(path):
-        with h5py.File(path, 'r') as f:
+        with h5py.File(path, "r") as f:
             if ("agentview" in f["root"]) and ("eye_in_hand" in f["root"]) and skip_exist:
                 return None
 
-    f = h5py.File(path, 'w')
+    f = h5py.File(path, "w")
     return f
 
 
 def get_attrs_and_view_names(demo_h5):
-    """ Get preproception states from h5 file object. """
-    attrs = json.loads(demo_h5.attrs['env_args'])
-    views = attrs['env_kwargs']['camera_names']
+    """Get preproception states from h5 file object."""
+    attrs = json.loads(demo_h5.attrs["env_args"])
+    views = attrs["env_kwargs"]["camera_names"]
     views.sort()
 
-    views = [name.replace('robot0_', '') if name.endswith("eye_in_hand") else name for name in views]
+    views = [name.replace("robot0_", "") if name.endswith("eye_in_hand") else name for name in views]
     return attrs, views
 
 
 def generate_data(source_h5_path, target_dir, track_model, task_emb, skip_exist):
-    demos = h5py.File(source_h5_path, 'r')['data']
+    demos = h5py.File(source_h5_path, "r")["data"]
     demo_keys = natsorted(list(demos.keys()))
     attrs, views = get_attrs_and_view_names(demos)
 
     # save environment meta data
-    with open(os.path.join(target_dir, 'env_meta.json'), 'w') as fp:
+    with open(os.path.join(target_dir, "env_meta.json"), "w") as fp:
         json.dump(attrs, fp)
 
     # setup visualization class
-    video_path = os.path.join(target_dir, 'videos')
+    video_path = os.path.join(target_dir, "videos")
     if not os.path.exists(video_path):
         os.makedirs(video_path, exist_ok=True)
     visualizer = Visualizer(save_dir=video_path, pad_value=0, fps=24)
@@ -234,20 +246,45 @@ def generate_data(source_h5_path, target_dir, track_model, task_emb, skip_exist)
         for idx in tqdm(range(len(demo_keys))):
             demo_k = demo_keys[idx]
             save_path = os.path.join(target_dir, f"{demo_k}.hdf5")
-            h5_file_handle = inital_save_h5(save_path, skip_exist)
             image_save_dir = os.path.join(target_dir, "images", demo_k)
 
+            h5_file_handle = inital_save_h5(save_path, skip_exist)
+
             if h5_file_handle is None:
+                # already exists and skip_exist indicated we should skip
                 continue
 
             try:
-                collect_states_from_demo(h5_file_handle, image_save_dir, demos, demo_k, views, track_model, task_emb, num_points, visualizer, save_vis=(idx%10==0))
+                collect_states_from_demo(
+                    h5_file_handle,
+                    image_save_dir,
+                    demos,
+                    demo_k,
+                    views,
+                    track_model,
+                    task_emb,
+                    num_points,
+                    visualizer,
+                    save_vis=False,
+                    # save_vis=(idx % 10 == 0),
+                )
                 h5_file_handle.close()
                 print(f"{save_path} is completed.")
             except Exception as e:
                 print(f"Exception {e} when processing {save_path}")
-                h5_file_handle.close()
+                try:
+                    h5_file_handle.close()
+                except Exception:
+                    pass
                 exit()
+
+        # If we processed the scene without fatal errors, write a simple scene-level done marker.
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            open(os.path.join(target_dir, "SCENE_DONE"), "w").close()
+        except Exception:
+            # best-effort: ignore if cannot write marker
+            pass
 
 
 @click.command()
@@ -264,18 +301,93 @@ def main(root, save, suite, skip_exist):
     """
     suite_dir = os.path.join(root, suite)
 
+    # Initialize Accelerator
+    accelerator = Accelerator()
+    rank = accelerator.process_index
+    world_size = accelerator.num_processes
+
     # setup cotracker
-    cotracker = torch.hub.load(os.path.join(os.path.expanduser("~"), ".cache/torch/hub/facebookresearch_co-tracker_main/"), "cotracker2", source="local")
+    cotracker = torch.hub.load(
+        os.path.join(os.path.expanduser("~"), ".cache/torch/hub/facebookresearch_co-tracker_main/"),
+        "cotracker2",
+        source="local",
+    )
     cotracker = cotracker.eval().cuda()
 
     # load task name embeddings
     task_bert_embs_dict = get_task_bert_embs(root)
 
-    for source_h5 in os.listdir(suite_dir):
+    scene_list = os.listdir(suite_dir)
+
+    # Clean up partially written or broken scene outputs before starting.
+    # Only run cleanup on rank 0 to avoid races; other ranks will see the cleaned directory after splitting.
+    save_suite_dir = os.path.join(save, suite)
+    if rank == 0:
+        if os.path.exists(save_suite_dir):
+            for entry in os.listdir(save_suite_dir):
+                entry_path = os.path.join(save_suite_dir, entry)
+                done_marker = os.path.join(entry_path, "SCENE_DONE")
+                # If entry is a directory but missing SCENE_DONE, remove it entirely as it may be incomplete.
+                if os.path.isdir(entry_path):
+                    if not os.path.exists(done_marker):
+                        try:
+                            print(f"Removing incomplete scene directory: {entry_path}")
+                            # use os.walk to remove tree
+                            for root_dir, dirs, files in os.walk(entry_path, topdown=False):
+                                for fname in files:
+                                    try:
+                                        os.remove(os.path.join(root_dir, fname))
+                                    except Exception:
+                                        pass
+                                for dname in dirs:
+                                    try:
+                                        os.rmdir(os.path.join(root_dir, dname))
+                                    except Exception:
+                                        pass
+                            try:
+                                os.rmdir(entry_path)
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            print(f"Warning: failed to remove {entry_path}: {e}")
+                else:
+                    # If entry is a file (stray), remove it
+                    try:
+                        print(f"Removing stray file in save dir: {entry_path}")
+                        os.remove(entry_path)
+                    except Exception:
+                        pass
+
+    # small barrier: let all ranks proceed after cleanup. If Accelerator is available use its barrier.
+    try:
+        accelerator.wait_for_everyone()
+    except Exception:
+        # fallback no-op
+        pass
+
+    # Filter scenes that already have been processed. A simple scene-level marker file
+    # "SCENE_DONE" is written into the scene save directory after successful processing.
+    remaining_scenes = []
+    for source_h5 in scene_list:
+        file_name = source_h5.split(".")[0]
+        save_dir = os.path.join(save, suite, file_name)
+        done_marker = os.path.join(save_dir, "SCENE_DONE")
+        if os.path.exists(done_marker):
+            continue
+        remaining_scenes.append(source_h5)
+
+    # Split remaining scenes across ranks (same semantics as before)
+    remaining_scenes = np.array(remaining_scenes)
+    scene_list_rank = np.array_split(remaining_scenes, world_size)[rank]
+    if rank == 0:
+        print(f"Total remaining scenes to process: {len(remaining_scenes)}")
+    print(f"On rank {rank}, got {len(scene_list_rank)} scenes: {scene_list_rank}")
+
+    for source_h5 in scene_list_rank:
         source_h5_path = os.path.join(suite_dir, source_h5)
-        file_name = source_h5.split('.')[0]
+        file_name = source_h5.split(".")[0]
         task_name = get_task_name_from_file_name(file_name)
- 
+
         save_dir = os.path.join(save, suite, file_name)
         os.makedirs(save_dir, exist_ok=True)
         generate_data(source_h5_path, save_dir, cotracker, task_bert_embs_dict[task_name], skip_exist)
