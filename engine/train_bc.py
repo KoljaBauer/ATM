@@ -128,7 +128,7 @@ def main(cfg: DictConfig):
                                                 f"{mode}/rollout_track": wandb_vid_rollout},
                                                 step=epoch)
 
-            if fabric.is_global_zero and hasattr(model, "forward_vis"):
+            if fabric.is_global_zero and hasattr(model, "forward_vis") and not cfg.model_cfg.get("use_traj_gen", False):
                 vis_and_log(model, train_vis_dataloader, mode="train")
                 vis_and_log(model, val_vis_dataloader, mode="val")
 
@@ -234,13 +234,13 @@ def visualize(model, dataloader, mix_precision=False):
     model.eval()
     keep_eval_dict = None
 
-    for obs, track_obs, track, task_emb, action, extra_states in dataloader:
+    for obs, track_obs, track, task_emb, action, extra_states, task_str in dataloader:
         obs, track_obs, track, task_emb = obs.cuda(), track_obs.cuda(), track.cuda(), task_emb.cuda()
         extra_states = {k: v.cuda() for k, v in extra_states.items()}
         if mix_precision:
             obs, track_obs, track, task_emb = obs.bfloat16(), track_obs.bfloat16(), track.bfloat16(), task_emb.bfloat16()
             extra_states = {k: v.bfloat16() for k, v in extra_states.items()}
-        _, eval_dict = model.forward_vis(obs, track_obs, track, task_emb, extra_states, action)
+        _, eval_dict = model.forward_vis(obs, track_obs, track, task_emb, extra_states, action, task_str)
         keep_eval_dict = eval_dict
         break
 

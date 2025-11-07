@@ -21,6 +21,7 @@ parser.add_argument("-tt", "--track-transformer", default=None, help="Then path 
 parser.add_argument("--load_path", default=None, help="path to trained policy.")
 parser.add_argument("--traj_gen_path", default=None, help="path to trained traj_gen.")
 parser.add_argument("--ae_dir", default=None, help="path to trained autoencoder for traj_gen.")
+parser.add_argument("--nfe", default=50, type=int, help="Number of forward evaluations.")
 args = parser.parse_args()
 
 # training configs
@@ -52,6 +53,7 @@ for seed in range(3):
                 f'model_cfg.load_path={args.load_path} '
                 f'+model_cfg.traj_gen_path={args.traj_gen_path} '
                 f'+model_cfg.ae_dir={args.ae_dir} '
-                f'+model_cfg.use_traj_gen={True}')
+                f'+model_cfg.use_traj_gen={True} ' 
+                f'+model_cfg.nfe={args.nfe}')
 
     os.system(commond)

@@ -86,7 +86,7 @@ class BCViLTPolicy(nn.Module):
 
     def __init__(self, obs_cfg, img_encoder_cfg, language_encoder_cfg, extra_state_encoder_cfg, track_cfg,
                  spatial_transformer_cfg, temporal_transformer_cfg,
-                 policy_head_cfg, load_path=None, use_traj_gen: bool = False, traj_gen_path: str = None, ae_dir: str = None):
+                 policy_head_cfg, load_path=None, use_traj_gen: bool = False, traj_gen_path: str = None, ae_dir: str = None, nfe: int=50):
         super().__init__()
 
         self._process_obs_shapes(**obs_cfg)
@@ -115,6 +115,7 @@ class BCViLTPolicy(nn.Module):
             cfg_traj_gen_model = cfg_traj_gen.model
             cfg_traj_gen_model.ae_ckpt_cfg.ae_ckpt = ae_dir
             cfg_traj_gen_model.model_ckpt_cfg = {}
+            cfg_traj_gen_model.multi_view = True
             traj_gen = hydra.utils.instantiate(cfg_traj_gen_model)
             traj_gen.eval()
 
@@ -134,6 +135,7 @@ class BCViLTPolicy(nn.Module):
             self.policy_num_track_ids = 8 # required to match input dim of policy head
 
             self.track_up_proj = nn.Linear(16, 128)
+            self.nfe = nfe
         else:
             self._setup_track(**track_cfg)
 
@@ -370,7 +372,7 @@ class BCViLTPolicy(nn.Module):
         return tr, _recon_tr
 
     
-    def track_encode_traj_gen(self, track_obs, task_str: list[str], nfe: int = 10):
+    def track_encode_traj_gen(self, track_obs, task_str: list[str]):
         with torch.autocast(device_type=track_obs.device.type, dtype=torch.bfloat16):
             B, v, t = track_obs.shape[:3]
             # v = 1 # for now we only use one view (side view)
@@ -404,8 +406,9 @@ class BCViLTPolicy(nn.Module):
                                                 track_conds=track_conds, 
                                                 start_frame=track_obs, 
                                                 txt_emb=txt_emb,
-                                                sample_steps=nfe,
-                                                decode_latent=False)
+                                                sample_steps=self.nfe,
+                                                decode_latent=False,
+                                                view_id=view_ids)
             
             n = track_embs.shape[-2]
 
@@ -564,7 +567,7 @@ class BCViLTPolicy(nn.Module):
         ret_dict["loss"] = ret_dict["bc_loss"]
         return loss.sum(), ret_dict
 
-    def forward_vis(self, obs, track_obs, track, task_emb, extra_states, action):
+    def forward_vis(self, obs, track_obs, track, task_emb, extra_states, action, task_str=None):
         """
         Args:
             obs: b v t c h w

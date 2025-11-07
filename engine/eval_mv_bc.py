@@ -101,6 +101,8 @@ def save_success_rate(epoch, success_metrics, summary_file_path):
 
 def evaluate(fabric, cfg, checkpoint, video_save_dir, num_env_rollouts=20, render_image_size=None, video_speedup=1,
              save_all_video=False, success_vid_first=False, fail_vid_first=False, connect_points_with_line=False):
+    
+    print(f"Evaluating checkpoint: {checkpoint}", flush=True)
     os.makedirs(video_save_dir, exist_ok=True)
     cfg.model_cfg.load_path = checkpoint
     model_cls = eval(cfg.model_name)
@@ -110,6 +112,7 @@ def evaluate(fabric, cfg, checkpoint, video_save_dir, num_env_rollouts=20, rende
     optimizer = setup_optimizer(cfg.optimizer_cfg, model)
 
     model, optimizer = fabric.setup(model, optimizer)
+    model.mark_forward_method('act')
 
     env_type = cfg.env_cfg.env_type
     rollout_horizon = cfg.env_cfg.get("horizon", None)
@@ -155,6 +158,7 @@ def evaluate(fabric, cfg, checkpoint, video_save_dir, num_env_rollouts=20, rende
 
 @hydra.main(version_base="1.3")
 def main(cfg: DictConfig):
+    print(f"Starting evaluation..", flush=True)
     save_path = cfg.save_path
     result_suffix = cfg.get("result_path_suffix", "")
     result_suffix = f"_{result_suffix}" if result_suffix else result_suffix
