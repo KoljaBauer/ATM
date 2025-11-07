@@ -131,7 +131,7 @@ class BCViLTPolicy(nn.Module):
             self.num_track_ids = 1 # we dont have explicit trajectories, just one latent
             self.num_track_patches_per_view = 16 * 16 # our latent dim is 16x16
             self.policy_num_track_ts = 16 * 16 # our latent dim is 16x16
-            self.policy_num_track_ids = 4 # required to match input dim of policy head
+            self.policy_num_track_ids = 8 # required to match input dim of policy head
 
             self.track_up_proj = nn.Linear(16, 128)
         else:
@@ -373,7 +373,7 @@ class BCViLTPolicy(nn.Module):
     def track_encode_traj_gen(self, track_obs, task_str: list[str], nfe: int = 10):
         with torch.autocast(device_type=track_obs.device.type, dtype=torch.bfloat16):
             B, v, t = track_obs.shape[:3]
-            v = 1 # for now we only use one view (side view)
+            # v = 1 # for now we only use one view (side view)
             sample_tensor = torch.randn(B * v * t, *self.track.val_shape).to(device=track_obs.device, dtype=track_obs.dtype)
 
             points_per_traj = 64
@@ -384,8 +384,13 @@ class BCViLTPolicy(nn.Module):
             track_conds = torch.zeros((B * v * t, 1, 5), device=track_obs.device, dtype=track_obs.dtype)
 
             # for now, we use only the side view and the last of the 10 frames
-            track_obs = track_obs[:, 0, :, 0, ...]  # b v t tt_fs c h w -> b t c h w
-            track_obs = rearrange(track_obs, "b t c h w -> (b t) h w c")
+            track_obs = track_obs[:, :, :, 0, ...]  # b v t tt_fs c h w -> b v t c h w
+
+            view_ids = torch.cat([torch.zeros((B, 1, t), device=track_obs.device, dtype=track_obs.dtype), 
+                                    torch.ones((B, 1, t), device=track_obs.device, dtype=track_obs.dtype)], dim=1)  # b v t
+            view_ids = rearrange(view_ids, "b v t -> (b v t)")
+
+            track_obs = rearrange(track_obs, "b v t c h w -> (b v t) h w c")
             track_obs = ((track_obs / 255.0) - 0.5) * 2 # map to [-1, 1] range
 
             with torch.no_grad():
@@ -407,8 +412,7 @@ class BCViLTPolicy(nn.Module):
             reshaped_latent = rearrange(track_embs, "(b v t) n c -> b v t 1 n c", b=B, v=v, t=t, n=n)
             
             track_embs = self.track_up_proj(track_embs)
-            track_embs = rearrange(track_embs, "(b v t) n c -> b (v t) n c", b=B, v=v, t=t)
-            track_embs = repeat(track_embs, "b t n c -> b t (v n) c", v=self.num_views)
+            track_embs = rearrange(track_embs, "(b v t) n c -> b t (v n) c", b=B, v=v, t=t)
 
         return track_embs, reshaped_latent
 
