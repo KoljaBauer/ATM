@@ -18,16 +18,19 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--suite", default="libero_goal", choices=["libero_spatial", "libero_object", "libero_goal", "libero_10"], 
                     help="The name of the desired suite, where libero_10 is the alias of libero_long.")
 parser.add_argument("-tt", "--track-transformer", default=None, help="Then path to the trained track transformer.")
+parser.add_argument("--use_traj_gen", action="store_true", help="Whether to use trajectory generation.")
 parser.add_argument("--load_path", default=None, help="path to trained policy.")
 parser.add_argument("--traj_gen_path", default=None, help="path to trained traj_gen.")
 parser.add_argument("--ae_dir", default=None, help="path to trained autoencoder for traj_gen.")
 parser.add_argument("--nfe", default=50, type=int, help="Number of forward evaluations.")
 args = parser.parse_args()
 
+print(f"args: {args}", flush=True)
+
 # training configs
 CONFIG_NAME = "libero_vilt"
 
-train_gpu_ids = [0, 1] # [0, 1, 2, 3]
+train_gpu_ids =  [0, 1, 2, 3]
 NUM_DEMOS = 10
 
 root_dir = "./data/atm_libero/"
@@ -53,7 +56,7 @@ for seed in range(3):
                 f'model_cfg.load_path={args.load_path} '
                 f'+model_cfg.traj_gen_path={args.traj_gen_path} '
                 f'+model_cfg.ae_dir={args.ae_dir} '
-                f'+model_cfg.use_traj_gen={True} ' 
+                f'+model_cfg.use_traj_gen={args.use_traj_gen} ' 
                 f'+model_cfg.nfe={args.nfe}')
 
     os.system(commond)

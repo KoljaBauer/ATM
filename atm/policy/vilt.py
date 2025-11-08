@@ -373,6 +373,12 @@ class BCViLTPolicy(nn.Module):
 
     
     def track_encode_traj_gen(self, track_obs, task_str: list[str]):
+        """
+        Args:
+            track_obs: b v t tt_fs c h w
+            task_str: list of tensors with shape (e,), length b
+        Returns: b v t track_len n 2
+        """
         with torch.autocast(device_type=track_obs.device.type, dtype=torch.bfloat16):
             B, v, t = track_obs.shape[:3]
             # v = 1 # for now we only use one view (side view)
@@ -385,8 +391,7 @@ class BCViLTPolicy(nn.Module):
 
             track_conds = torch.zeros((B * v * t, 1, 5), device=track_obs.device, dtype=track_obs.dtype)
 
-            # for now, we use only the side view and the last of the 10 frames
-            track_obs = track_obs[:, :, :, 0, ...]  # b v t tt_fs c h w -> b v t c h w
+            track_obs = track_obs[:, :, :, -1, ...]  # b v t tt_fs c h w -> b v t c h w
 
             view_ids = torch.cat([torch.zeros((B, 1, t), device=track_obs.device, dtype=track_obs.dtype), 
                                     torch.ones((B, 1, t), device=track_obs.device, dtype=track_obs.dtype)], dim=1)  # b v t
@@ -658,7 +663,35 @@ class BCViLTPolicy(nn.Module):
 
         action = action.reshape(-1, *self.act_shape)
         action = torch.clamp(action, -1, 1)
-        return action.float().cpu().numpy(), (None, rec_tracks[:, :, -1, :, :, :])  # (b, *act_shape)
+
+        if self.use_traj_gen: # Decode tracks for visualization
+            # reshaped latent is b v t 1 n c
+            latent = rearrange(rec_tracks, "b v t 1 n c -> (b v t) n c")
+            latent_denorm = self.track.denormalize_latents(latent)  # Unnormalize and un-center generated latents
+
+            start_frame = ((track_obs[:, :, 0, -1, ...] / 255.0) - 0.5) * 2  # b v c h w
+            start_frame = rearrange(start_frame, "b v c h w -> (b v) h w c")
+
+            grid_points = sample_double_grid(7, device=track_obs.device, dtype=track_obs.dtype) # (2*n*n) 2
+            grid_points = grid_points[:80, :] # our decoder expects 80 tracks
+            B, v, t = track_obs.shape[:3]
+            query_pos = (repeat(grid_points, "n c -> b_new n c", b_new=B * v * t) - 0.5) * 2  # scale to [-1, 1]
+
+            with torch.autocast(device_type=track_obs.device.type, dtype=torch.bfloat16):
+                decoded_tracks = self.track.ae.decode(latents=latent_denorm,
+                                    query_pos=query_pos,
+                                    points_per_track=64,
+                                    start_frame=start_frame)
+
+                decoded_tracks = (decoded_tracks + 1) / 2 # map back to [0, 1]
+
+                vis_tracks = decoded_tracks[:, :, ::4, :].flip(-1) # yx to xy, subsample from 64 to 16
+                vis_tracks = rearrange(vis_tracks, "(b v) n t_frames c -> b v t_frames n c", v=self.num_views, b=B)
+
+        else:
+            vis_tracks = rec_tracks[:, :, -1, :, :, :]
+
+        return action.float().cpu().numpy(), (None, vis_tracks)  # (b, *act_shape)
 
     def reset(self):
         self.latent_queue.clear()

@@ -64,6 +64,15 @@ def rollout(env_dict, policy, num_env_rollouts, horizon=None, return_wandb_video
     all_env_descriptions = []
 
     for env_description, (env_idx, env) in env_dict.items():
+        print(f"Rolling out env {env_idx}: {env_description} ..", flush=True)
+
+        task_str_word_list = env_description.split('/')[-1].split('_')[2:]
+        if all(c.isupper() for c in task_str_word_list[0] if c.isalpha()): #remove first word if it's ALL CAPS (eg 'SCENE1')
+            task_str_word_list = task_str_word_list[1:]
+
+        task_str = ' '.join(task_str_word_list)  # our model needs the task string, so we patch the DL here
+        print(f"Task string: {task_str} ; {task_str_word_list=}", flush=True)
+
         all_env_indices.append(env_idx)
         all_rewards = []
         all_succ = []
@@ -76,6 +85,7 @@ def rollout(env_dict, policy, num_env_rollouts, horizon=None, return_wandb_video
             last_info = None
             episode_frames = []
             obs = env.reset()
+            print(f"{obs.keys()=}", flush=True)
             policy.reset()
             done = False
             step_i = 0
@@ -83,7 +93,10 @@ def rollout(env_dict, policy, num_env_rollouts, horizon=None, return_wandb_video
                 rgb = obs["image"]  # (b, v, h, w, c)
                 task_emb = obs.get("task_emb", None)
                 extra_states = {k: obs[obs_key_mapping[k]] for k in policy.extra_state_keys}
-                a, _tracks = policy.act(rgb, task_emb, extra_states)
+
+                task_str_list = [task_str] * rgb.shape[0]
+
+                a, _tracks = policy.act(rgb, task_emb, extra_states, task_str=task_str_list)
                 obs, r, done, info = env.step(a)
                 reward = list(r) if reward is None else [old_r + new_r for old_r, new_r in zip(reward, r)]
                 done = all(done)
@@ -120,6 +133,8 @@ def rollout(env_dict, policy, num_env_rollouts, horizon=None, return_wandb_video
             all_rewards += reward
             all_horizon += [step_i + 1]
             all_succ += success
+
+            print(f"Finished Rollout. {success=} ; {reward=} ; {step_i=}", flush=True)
 
         if len(additional_metrics) == 0:
             additional_metrics = {k: [v] for k, v in last_info.items() if k != "success"}

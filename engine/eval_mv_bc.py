@@ -181,8 +181,10 @@ def main(cfg: DictConfig):
     ckp_paths_to_eval = get_ckp_list(save_path, summary_file_path, reverse=True)
 
     setup(cfg)
+    print(f"{cfg.mix_precision=}", flush=True)
 
-    fabric = Fabric(accelerator="cuda", devices=list(cfg.train_gpus), strategy="ddp")
+    # fabric = Fabric(accelerator="cuda", devices=list(cfg.train_gpus), strategy="ddp")
+    fabric = Fabric(accelerator="cuda", devices=list(cfg.train_gpus), precision="bf16-mixed" if cfg.mix_precision else None, strategy="deepspeed")
     fabric.launch()
 
     for ckp_path in ckp_paths_to_eval:

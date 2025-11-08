@@ -77,6 +77,8 @@ def main(cfg: DictConfig):
 
     fabric.barrier()
     for epoch in metric_logger.log_every(range(cfg.epochs), 1, ""):
+
+        print(f"Starting epoch {epoch} ..", flush=True)
         train_metrics = run_one_epoch(
             fabric,
             model,
@@ -86,6 +88,7 @@ def main(cfg: DictConfig):
             mix_precision=cfg.mix_precision,
             scheduler=scheduler,
         )
+        print(f"Finished epoch {epoch} ..", flush=True)
 
         train_metrics["train/lr"] = optimizer.param_groups[0]["lr"]
         metric_logger.update(**train_metrics)
@@ -94,6 +97,7 @@ def main(cfg: DictConfig):
             None if cfg.dry else wandb.log(train_metrics, step=epoch)
 
             if epoch % cfg.val_freq == 0:
+                print(f"Starting evaluation after epoch {epoch} ..", flush=True)
                 val_metrics = evaluate(model,
                                           val_loader,
                                           mix_precision=cfg.mix_precision,
@@ -133,8 +137,10 @@ def main(cfg: DictConfig):
                 vis_and_log(model, val_vis_dataloader, mode="val")
 
             gathered_results = [{} for _ in range(fabric.world_size)]
-            results = rollout(rollout_env, model, 20 // cfg.env_cfg.vec_env_num, horizon=rollout_horizon)
+            print(f"Starting rollout evaluation after epoch {epoch} ..", flush=True)
+            results = rollout(rollout_env, model, 10 // cfg.env_cfg.vec_env_num, horizon=rollout_horizon)
             fabric.barrier()
+            print(f"Finished rollout evaluation after epoch {epoch} ..", flush=True)
             dist.all_gather_object(gathered_results, results)
             if fabric.is_global_zero:
                 gathered_results = merge_results(gathered_results)
