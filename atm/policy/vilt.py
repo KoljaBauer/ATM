@@ -32,6 +32,34 @@ import tempfile
 
 from typing import List
 from pathlib import Path
+from jaxtyping import Float
+from scipy.interpolate import interp1d
+
+def interpolate_trajectories(traj: Float[np.ndarray, "N T 2"], temporal_upsampling_fac: int = 4, kind="cubic"):
+    """
+    Interpolates trajectories along the temporal dimension using scipy interp1d.
+
+    Args:
+        traj (np.ndarray): shape (N, T, 2), values in [-1, 1]
+        temporal_upsampling_fac (int): upsampling factor (default 4)
+        kind (str): interpolation type ('linear', 'cubic', 'quadratic', etc.)
+
+    Returns:
+        np.ndarray: interpolated trajectories of shape (N, scale*T, 2)
+    """
+    N, T, _ = traj.shape
+    t_original = np.linspace(0, 1, T)
+
+    new_t = int(temporal_upsampling_fac * T)
+    t_interp = np.linspace(0, 1, new_t)
+
+    traj_interp = np.zeros((N, new_t, 2), dtype=np.float32)
+    for i in range(N):
+        for c in range(2):  # y and x
+            f = interp1d(t_original, traj[i, :, c], kind=kind)
+            traj_interp[i, :, c] = f(t_interp)
+
+    return traj_interp
 
 def consolidate_ckpt(checkpoint_path: str | Path):
     if not isinstance(checkpoint_path, Path):
@@ -86,7 +114,7 @@ class BCViLTPolicy(nn.Module):
 
     def __init__(self, obs_cfg, img_encoder_cfg, language_encoder_cfg, extra_state_encoder_cfg, track_cfg,
                  spatial_transformer_cfg, temporal_transformer_cfg,
-                 policy_head_cfg, load_path=None, use_traj_gen: bool = False, traj_gen_path: str = None, ae_dir: str = None, nfe: int=50):
+                 policy_head_cfg, load_path=None, use_traj_gen: bool = False, traj_gen_path: str = None, ae_dir: str = None, nfe: int=50, traj_gen_only_ae: bool = False):
         super().__init__()
 
         self._process_obs_shapes(**obs_cfg)
@@ -99,7 +127,8 @@ class BCViLTPolicy(nn.Module):
 
         # 3. Track Transformer module
         self.use_traj_gen = use_traj_gen
-        if self.use_traj_gen:
+        self.traj_gen_only_ae = traj_gen_only_ae
+        if self.use_traj_gen or self.traj_gen_only_ae:
             assert traj_gen_path is not None and ae_dir is not None, "When using trajectory generator, traj_gen_path and ae_dir must be provided."
             import sys
             sys.path.append("/export/home/ra48gaq/code/trajectory-ae/diffusion")
@@ -124,9 +153,14 @@ class BCViLTPolicy(nn.Module):
             traj_gen.load_state_dict(sd, strict=True)
 
             # Compile UNET forward for speed
-            traj_gen.unet.forward = torch.compile(traj_gen.unet.forward, mode="reduce-overhead", dynamic=True)
+            if self.use_traj_gen:
+                traj_gen.unet.forward = torch.compile(traj_gen.unet.forward, mode="reduce-overhead", dynamic=True)
 
-            self.track = traj_gen
+            if self.use_traj_gen:
+                self.track = traj_gen
+            elif self.traj_gen_only_ae:
+                self.traj_gen = traj_gen
+                self._setup_track(**track_cfg)
 
             self.num_track_ts = 1 # our latents completely compress temporal dim
             self.num_track_ids = 1 # we dont have explicit trajectories, just one latent
@@ -158,8 +192,8 @@ class BCViLTPolicy(nn.Module):
         self._setup_policy_head(**policy_head_cfg)
 
         if load_path is not None:
-            drop_keys = ['policy_head'] if self.use_traj_gen else []
-            self.load(load_path, strict=(not self.use_traj_gen), drop_keys=drop_keys)
+            drop_keys = ['policy_head'] if (self.use_traj_gen or self.traj_gen_only_ae) else []
+            self.load(load_path, strict=(not (self.use_traj_gen or self.traj_gen_only_ae)), drop_keys=drop_keys)
             if not self.use_traj_gen:
                 self.track.load(f"{track_cfg.track_fn}/model_best.ckpt")
 
@@ -229,7 +263,7 @@ class BCViLTPolicy(nn.Module):
         spatial_token = nn.Parameter(torch.randn(1, 1, self.spatial_embed_size))  # SPATIAL_TOKEN
         img_patch_pos_embed = nn.Parameter(torch.randn(1, self.img_num_patches, self.spatial_embed_size))
 
-        if not self.use_traj_gen:
+        if not (self.use_traj_gen or self.traj_gen_only_ae):
             track_patch_pos_embed = nn.Parameter(torch.randn(1, self.num_track_patches, self.spatial_embed_size-self.track_id_embed_dim))
             self.register_parameter("track_patch_pos_embed", track_patch_pos_embed)
 
@@ -371,6 +405,56 @@ class BCViLTPolicy(nn.Module):
 
         return tr, _recon_tr
 
+    def track_encode_traj_gen_ae(self, track_obs, task_emb):
+        """
+        Args:
+            track_obs: b v t tt_fs c h w
+            task_emb: b e
+        Returns: b v t track_len n 2
+        """
+        b, v, t, *_ = track_obs.shape
+
+        track_obs_to_pred = rearrange(track_obs, "b v t fs c h w -> (b v t) fs c h w")
+
+        grid_points = sample_double_grid(4, device=track_obs.device, dtype=track_obs.dtype)
+        grid_sampled_track = repeat(grid_points, "n d -> b v t tl n d", b=b, v=v, t=t, tl=16) # atm track predictor expects 16 timesteps
+        grid_sampled_track = rearrange(grid_sampled_track, "b v t tl n d -> (b v t) tl n d")
+
+        expand_task_emb = repeat(task_emb, "b e -> b v t e", b=b, v=v, t=t)
+        expand_task_emb = rearrange(expand_task_emb, "b v t e -> (b v t) e")
+
+        print(f"Before track reconstruct: {track_obs_to_pred.shape}, {grid_sampled_track.shape}, {expand_task_emb.shape}; {track_obs.shape=}", flush=True)
+        with torch.no_grad():
+            pred_tr, _ = self.track.reconstruct(track_obs_to_pred, grid_sampled_track, expand_task_emb, p_img=0)  # (b v t) tl n d
+
+        print(f"Reconstructed traj gen track shape: {pred_tr.shape}")
+
+        # here we interpolate the predicted trajectories to match what the AE expects
+        pred_tr_list = [interpolate_trajectories(rearrange(pred_tr[i, ...].float().cpu().numpy(), "t n d -> n t d")) for i in range(pred_tr.shape[0])]
+        print(f"Interpolated traj gen track shape: {pred_tr_list[0].shape}", flush=True)
+        pred_tr = torch.tensor(np.stack(pred_tr_list, axis=0), device=track_obs.device, dtype=track_obs.dtype)  # (b v t) new_t n d
+        print(f"Interpolated and stacked pred_tr: {pred_tr.shape}", flush=True)
+
+        track_obs = track_obs[:, :, :, -1, ...]  # b v t tt_fs c h w -> b v t c h w
+        track_obs = rearrange(track_obs, "b v t c h w -> (b v t) h w c")
+        track_obs = ((track_obs / 255.0) - 0.5) * 2 # map to [-1, 1] range
+        print(f"Track obs shape for traj gen ae encoding: {track_obs.shape}")
+
+        with torch.autocast(device_type=track_obs.device.type, dtype=torch.bfloat16), torch.no_grad():
+            enc_out = self.traj_gen.ae.encode(pred_tr, start_frame=track_obs)  # (b v t) n c
+            latent = enc_out.mean
+
+        print(f"Reconstructed traj gen track shape: {latent.shape}")
+
+        reshaped_latent = rearrange(latent, "(b v t) n c -> b v t 1 n c", b=b, v=v, t=t)
+
+        latent = self.track_up_proj(latent)
+        print(f"After up proj latent shape: {latent.shape}")
+        latent = rearrange(latent, "(b v t) n c -> b t (v n) c", b=b, v=v, t=t)
+        print(f"After rearrange latent shape: {latent.shape}")
+
+        return latent, reshaped_latent
+
     
     def track_encode_traj_gen(self, track_obs, task_str: list[str]):
         """
@@ -459,6 +543,8 @@ class BCViLTPolicy(nn.Module):
         if self.use_traj_gen:
             assert task_str is not None, "When using trajectory generator, task_str must be provided."
             track_encoded, _recon_track = self.track_encode_traj_gen(track_obs, task_str)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
+        elif self.traj_gen_only_ae:
+            track_encoded, _recon_track = self.track_encode_traj_gen_ae(track_obs, task_emb)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
         else:
             track_encoded, _recon_track = self.track_encode(track_obs, task_emb)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
 
@@ -542,7 +628,7 @@ class BCViLTPolicy(nn.Module):
         x = self.temporal_encode(x)  # (b, t, c)
         recon_track = rearrange(recon_track, "b v t tl n d -> b t (v tl n d)")
         x = torch.cat([x, recon_track], dim=-1)  # (b, t, c + v*tl*n*2)
-        dist = self.policy_head(x)  # only use the current timestep feature to predict action
+        dist = self.policy_head(x) # (b, t)  # only use the current timestep feature to predict action
         return dist
 
     def forward_loss(self, obs, track_obs, track, task_emb, extra_states, action, task_str=None):
@@ -664,7 +750,7 @@ class BCViLTPolicy(nn.Module):
         action = action.reshape(-1, *self.act_shape)
         action = torch.clamp(action, -1, 1)
 
-        if self.use_traj_gen: # Decode tracks for visualization
+        if self.use_traj_gen or self.traj_gen_only_ae: # Decode tracks for visualization
             # reshaped latent is b v t 1 n c
             latent = rearrange(rec_tracks, "b v t 1 n c -> (b v t) n c")
             latent_denorm = self.track.denormalize_latents(latent)  # Unnormalize and un-center generated latents
@@ -687,6 +773,7 @@ class BCViLTPolicy(nn.Module):
 
                 vis_tracks = decoded_tracks[:, :, ::4, :].flip(-1) # yx to xy, subsample from 64 to 16
                 vis_tracks = rearrange(vis_tracks, "(b v) n t_frames c -> b v t_frames n c", v=self.num_views, b=B)
+
 
         else:
             vis_tracks = rec_tracks[:, :, -1, :, :, :]
