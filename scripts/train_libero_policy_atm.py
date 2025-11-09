@@ -20,6 +20,7 @@ parser.add_argument("--suite", default="libero_goal", choices=["libero_spatial",
 parser.add_argument("-tt", "--track-transformer", default=None, help="Then path to the trained track transformer.")
 parser.add_argument("--use_traj_gen", action="store_true", help="Whether to use trajectory generation.")
 parser.add_argument("--traj_gen_only_ae", action="store_true", help="Whether to use trajectory AE.")
+parser.add_argument("--decode_latents", action="store_true", help="Whether to decode latents in trajectory generation.")
 parser.add_argument("--load_path", default=None, help="path to trained policy.")
 parser.add_argument("--traj_gen_path", default=None, help="path to trained traj_gen.")
 parser.add_argument("--ae_dir", default=None, help="path to trained autoencoder for traj_gen.")
@@ -59,6 +60,7 @@ for seed in range(3):
                 f'+model_cfg.ae_dir={args.ae_dir} '
                 f'+model_cfg.use_traj_gen={args.use_traj_gen} '
                 f'+model_cfg.traj_gen_only_ae={args.traj_gen_only_ae} '
+                f'+model_cfg.decode_latents={args.decode_latents} '
                 f'+model_cfg.nfe={args.nfe}')
 
     os.system(commond)

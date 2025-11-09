@@ -114,7 +114,7 @@ class BCViLTPolicy(nn.Module):
 
     def __init__(self, obs_cfg, img_encoder_cfg, language_encoder_cfg, extra_state_encoder_cfg, track_cfg,
                  spatial_transformer_cfg, temporal_transformer_cfg,
-                 policy_head_cfg, load_path=None, use_traj_gen: bool = False, traj_gen_path: str = None, ae_dir: str = None, nfe: int=50, traj_gen_only_ae: bool = False):
+                 policy_head_cfg, load_path=None, use_traj_gen: bool = False, traj_gen_path: str = None, ae_dir: str = None, nfe: int=50, traj_gen_only_ae: bool = False, decode_latents: bool = False):
         super().__init__()
 
         self._process_obs_shapes(**obs_cfg)
@@ -128,6 +128,7 @@ class BCViLTPolicy(nn.Module):
         # 3. Track Transformer module
         self.use_traj_gen = use_traj_gen
         self.traj_gen_only_ae = traj_gen_only_ae
+        self.decode_latents = decode_latents
         if self.use_traj_gen or self.traj_gen_only_ae:
             assert traj_gen_path is not None and ae_dir is not None, "When using trajectory generator, traj_gen_path and ae_dir must be provided."
             import sys
@@ -162,11 +163,26 @@ class BCViLTPolicy(nn.Module):
                 self.traj_gen = traj_gen
                 self._setup_track(**track_cfg)
 
-            self.num_track_ts = 1 # our latents completely compress temporal dim
-            self.num_track_ids = 1 # we dont have explicit trajectories, just one latent
-            self.num_track_patches_per_view = 16 * 16 # our latent dim is 16x16
-            self.policy_num_track_ts = 16 * 16 # our latent dim is 16x16
-            self.policy_num_track_ids = 8 # required to match input dim of policy head
+            if self.decode_latents:
+                self.num_track_ids = 32
+                self.num_track_ts = 16
+                self.track_proj_encoder = TrackPatchEmbed(
+                                            num_track_ts=self.num_track_ts,
+                                            num_track_ids=self.num_track_ids, # what our AE decoder outputs
+                                            patch_size=16,
+                                            in_dim=2 + self.num_views,  # X, Y, one-hot view embedding
+                                            embed_dim=self.spatial_embed_size)
+                
+                self.track_id_embed_dim = 16
+                self.num_track_patches_per_view = self.track_proj_encoder.num_patches_per_track
+                self.num_track_patches = self.num_track_patches_per_view * self.num_views
+
+            else:
+                self.num_track_ts = 1 # our latents completely compress temporal dim
+                self.num_track_ids = 1 # we dont have explicit trajectories, just one latent
+                self.num_track_patches_per_view = 16 * 16 # our latent dim is 16x16
+                self.policy_num_track_ts = 16 * 16 # our latent dim is 16x16
+                self.policy_num_track_ids = 8 # required to match input dim of policy head
 
             self.track_up_proj = nn.Linear(16, 128)
             self.nfe = nfe
@@ -263,7 +279,8 @@ class BCViLTPolicy(nn.Module):
         spatial_token = nn.Parameter(torch.randn(1, 1, self.spatial_embed_size))  # SPATIAL_TOKEN
         img_patch_pos_embed = nn.Parameter(torch.randn(1, self.img_num_patches, self.spatial_embed_size))
 
-        if not (self.use_traj_gen or self.traj_gen_only_ae):
+        
+        if not (self.use_traj_gen or self.traj_gen_only_ae) or self.decode_latents:
             track_patch_pos_embed = nn.Parameter(torch.randn(1, self.num_track_patches, self.spatial_embed_size-self.track_id_embed_dim))
             self.register_parameter("track_patch_pos_embed", track_patch_pos_embed)
 
@@ -438,7 +455,7 @@ class BCViLTPolicy(nn.Module):
         track_obs = track_obs[:, :, :, -1, ...]  # b v t tt_fs c h w -> b v t c h w
         track_obs = rearrange(track_obs, "b v t c h w -> (b v t) h w c")
         track_obs = ((track_obs / 255.0) - 0.5) * 2 # map to [-1, 1] range
-        print(f"Track obs shape for traj gen ae encoding: {track_obs.shape}")
+        print(f"Track obs shape for traj gen ae encoding: {track_obs.shape} ; {pred_tr.dtype=} ; {pred_tr.device=};{track_obs.dtype=}  {track_obs.device=}")
 
         with torch.autocast(device_type=track_obs.device.type, dtype=torch.bfloat16), torch.no_grad():
             enc_out = self.traj_gen.ae.encode(pred_tr, start_frame=track_obs)  # (b v t) n c
@@ -498,15 +515,40 @@ class BCViLTPolicy(nn.Module):
                                                 sample_steps=self.nfe,
                                                 decode_latent=False,
                                                 view_id=view_ids)
-            
-            n = track_embs.shape[-2]
+                
+                if self.decode_latents:
+                    decoded_tracks = self.track.ae.decode(latents=track_embs,
+                                        query_pos=query_pos,
+                                        points_per_track=64,
+                                        start_frame=track_obs)
+                    print(f"After decoder: {decoded_tracks.shape=}", flush=True)
+                    
+                    decoded_tracks = (decoded_tracks + 1) / 2 # map back to [0, 1]
+                    decoded_tracks = decoded_tracks[:, :, ::4, :].flip(-1) # yx to xy, subsample from 64 to 16
 
-            reshaped_latent = rearrange(track_embs, "(b v t) n c -> b v t 1 n c", b=B, v=v, t=t, n=n)
-            
-            track_embs = self.track_up_proj(track_embs)
-            track_embs = rearrange(track_embs, "(b v t) n c -> b t (v n) c", b=B, v=v, t=t)
+                    decoded_tracks = rearrange(decoded_tracks, "(b v t) n tl d -> b v t tl n d", b=B, v=v, t=t)
+                    decoded_tracks = decoded_tracks.clone()  # b v t tl n 2
+                    with torch.no_grad():
+                        tr_view = self._get_view_one_hot(decoded_tracks)  # b v t tl n c
 
-        return track_embs, reshaped_latent
+                    tr_view = rearrange(tr_view, "b v t tl n c -> (b v t) tl n c")
+                    tr = self.track_proj_encoder(tr_view)  # (b v t) track_patch_num n d
+                    tr = rearrange(tr, "(b v t) pn n d -> (b t n) (v pn) d", b=B, v=v, t=t, n=self.num_track_ids)  # (b t n) (v patch_num) d
+
+                    track_feat = tr
+                    track_recon = decoded_tracks
+
+                else:
+            
+                    n = track_embs.shape[-2]
+                    reshaped_latent = rearrange(track_embs, "(b v t) n c -> b v t 1 n c", b=B, v=v, t=t, n=n)
+                    
+                    track_embs = self.track_up_proj(track_embs)
+                    track_embs = rearrange(track_embs, "(b v t) n c -> b t (v n) c", b=B, v=v, t=t)
+                    track_feat = track_embs
+                    track_recon = reshaped_latent
+
+        return track_feat, track_recon
 
 
     def spatial_encode(self, obs, track_obs, task_emb, extra_states, return_recon=False, task_str=None):
@@ -543,6 +585,18 @@ class BCViLTPolicy(nn.Module):
         if self.use_traj_gen:
             assert task_str is not None, "When using trajectory generator, task_str must be provided."
             track_encoded, _recon_track = self.track_encode_traj_gen(track_obs, task_str)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
+            print(f"After track_encode_traj_gen: {track_encoded.shape=} ; {_recon_track.shape=}", flush=True)
+            print(f"After track_encode_traj_gen: {self.track_id_embed_dim=} ; {self.track_patch_pos_embed.shape=}", flush=True)
+            if self.decode_latents:
+                # patch position embedding
+                tr_feat, tr_id_emb = track_encoded[:, :, :-self.track_id_embed_dim], track_encoded[:, :, -self.track_id_embed_dim:]
+                tr_feat += self.track_patch_pos_embed  # ((b t n), 2*patch_num, c)
+                # track id embedding
+                tr_id_emb[:, 1:, -self.track_id_embed_dim:] = tr_id_emb[:, :1, -self.track_id_embed_dim:]  # guarantee the permutation invariance
+                track_encoded = torch.cat([tr_feat, tr_id_emb], dim=-1)
+                track_encoded = rearrange(track_encoded, "(b t n) pn d -> b t (n pn) d", b=B, t=T)  # (b, t, 2*num_track*num_track_patch, c)
+        
+        
         elif self.traj_gen_only_ae:
             track_encoded, _recon_track = self.track_encode_traj_gen_ae(track_obs, task_emb)  # track_encoded: ((b t n), 2*patch_num, c)  _recon_track: (b, v, track_len, n, 2)
         else:
@@ -751,29 +805,31 @@ class BCViLTPolicy(nn.Module):
         action = torch.clamp(action, -1, 1)
 
         if self.use_traj_gen or self.traj_gen_only_ae: # Decode tracks for visualization
-            # reshaped latent is b v t 1 n c
-            latent = rearrange(rec_tracks, "b v t 1 n c -> (b v t) n c")
-            latent_denorm = self.track.denormalize_latents(latent)  # Unnormalize and un-center generated latents
+            if self.decode_latents: # latents are already decoded in the traj gen model
+                vis_tracks = rec_tracks[:, :, -1, :, :, :]
+            else:
+                # reshaped latent is b v t 1 n c
+                latent = rearrange(rec_tracks, "b v t 1 n c -> (b v t) n c")
+                latent_denorm = self.track.denormalize_latents(latent)  # Unnormalize and un-center generated latents
 
-            start_frame = ((track_obs[:, :, 0, -1, ...] / 255.0) - 0.5) * 2  # b v c h w
-            start_frame = rearrange(start_frame, "b v c h w -> (b v) h w c")
+                start_frame = ((track_obs[:, :, 0, -1, ...] / 255.0) - 0.5) * 2  # b v c h w
+                start_frame = rearrange(start_frame, "b v c h w -> (b v) h w c")
 
-            grid_points = sample_double_grid(7, device=track_obs.device, dtype=track_obs.dtype) # (2*n*n) 2
-            grid_points = grid_points[:80, :] # our decoder expects 80 tracks
-            B, v, t = track_obs.shape[:3]
-            query_pos = (repeat(grid_points, "n c -> b_new n c", b_new=B * v * t) - 0.5) * 2  # scale to [-1, 1]
+                grid_points = sample_double_grid(7, device=track_obs.device, dtype=track_obs.dtype) # (2*n*n) 2
+                grid_points = grid_points[:80, :] # our decoder expects 80 tracks
+                B, v, t = track_obs.shape[:3]
+                query_pos = (repeat(grid_points, "n c -> b_new n c", b_new=B * v * t) - 0.5) * 2  # scale to [-1, 1]
 
-            with torch.autocast(device_type=track_obs.device.type, dtype=torch.bfloat16):
-                decoded_tracks = self.track.ae.decode(latents=latent_denorm,
-                                    query_pos=query_pos,
-                                    points_per_track=64,
-                                    start_frame=start_frame)
+                with torch.autocast(device_type=track_obs.device.type, dtype=torch.bfloat16):
+                    decoded_tracks = self.track.ae.decode(latents=latent_denorm,
+                                        query_pos=query_pos,
+                                        points_per_track=64,
+                                        start_frame=start_frame)
 
-                decoded_tracks = (decoded_tracks + 1) / 2 # map back to [0, 1]
+                    decoded_tracks = (decoded_tracks + 1) / 2 # map back to [0, 1]
 
-                vis_tracks = decoded_tracks[:, :, ::4, :].flip(-1) # yx to xy, subsample from 64 to 16
-                vis_tracks = rearrange(vis_tracks, "(b v) n t_frames c -> b v t_frames n c", v=self.num_views, b=B)
-
+                    vis_tracks = decoded_tracks[:, :, ::4, :].flip(-1) # yx to xy, subsample from 64 to 16
+                    vis_tracks = rearrange(vis_tracks, "(b v) n t_frames c -> b v t_frames n c", v=self.num_views, b=B)
 
         else:
             vis_tracks = rec_tracks[:, :, -1, :, :, :]
